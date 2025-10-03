@@ -3,7 +3,7 @@ import jwt
 import httpx
 from functools import lru_cache
 from typing import Dict, Any
-
+from datetime import datetime, timezone
 
 from core.config import settings
 
@@ -21,17 +21,23 @@ def get_private_key() -> bytes:
 
 
 def generate_jwt_token() -> str:
-    current_time = int(time.time())
+    now = datetime.now(timezone.utc)
+    current_time = int(now.timestamp())
+
+    expiration_time = current_time + 540
 
     payload = {
-        "iat": current_time,
-        "exp": current_time + 600,
+        "iat": current_time - 60,
+        "exp": expiration_time,
         "iss": settings.GITHUB_APP_ID,
     }
 
     private_key = get_private_key()
-
     token = jwt.encode(payload, private_key, algorithm="RS256")
+
+    print(
+        f"JWT generated - IAT: {current_time - 60}, EXP: {expiration_time}, Duration: {expiration_time - (current_time - 60)}s"
+    )
 
     return token
 
@@ -71,15 +77,12 @@ async def get_installation_access_token(installation_id: int) -> str:
 
 
 class GitHubService:
-    """A wrapper class for interacting with the GitHub API on behalf of an installation."""
-
     def __init__(self, installation_id: int):
         self.installation_id = installation_id
         self._token = None
         self._headers = None
 
     async def _authenticate(self):
-        """Authenticates the service by obtaining an installation access token."""
         if not self._token:
             self._token = await get_installation_access_token(self.installation_id)
             self._headers = {
@@ -90,7 +93,6 @@ class GitHubService:
     async def get_pr_details(
         self, repo_full_name: str, pr_number: int
     ) -> Dict[str, Any]:
-        """Fetches the title and body of a pull request."""
         await self._authenticate()
         url = f"https://api.github.com/repos/{repo_full_name}/pulls/{pr_number}"
 
@@ -104,7 +106,6 @@ class GitHubService:
             }
 
     async def get_pr_diff(self, repo_full_name: str, pr_number: int) -> str:
-        """Fetches the diff for a pull request."""
         await self._authenticate()
         url = f"https://api.github.com/repos/{repo_full_name}/pulls/{pr_number}"
 
@@ -123,7 +124,6 @@ class GitHubService:
         review_summary: str,
         review_comments: list,
     ):
-        """Posts a review with comments to a pull request."""
         await self._authenticate()
         url = f"https://api.github.com/repos/{repo_full_name}/pulls/{pr_number}/reviews"
 
@@ -133,17 +133,58 @@ class GitHubService:
             pr_response.raise_for_status()
             head_sha = pr_response.json()["head"]["sha"]
 
+        valid_comments = []
+        for i, comment in enumerate(review_comments):
+            if not isinstance(comment, dict):
+                print(f"Skipping non-dict comment at index {i}: {comment}")
+                continue
+
+            if "path" not in comment or "body" not in comment:
+                print(f"Skipping comment without path or body: {comment}")
+                continue
+
+            if "side" not in comment:
+                comment["side"] = "RIGHT"
+
+            if "line" not in comment or not isinstance(comment["line"], int):
+                print(f"Skipping comment without valid line number: {comment}")
+                continue
+
+            valid_comments.append(
+                {
+                    "path": comment["path"],
+                    "line": comment["line"],
+                    "side": comment["side"],
+                    "body": comment["body"],
+                }
+            )
+
         review_payload = {
             "commit_id": head_sha,
             "body": review_summary,
             "event": "COMMENT",
-            "comments": review_comments,
         }
+
+        if valid_comments:
+            review_payload["comments"] = valid_comments
+            print(f"Posting review with {len(valid_comments)} comments")
+            print(f"Sample comment: {valid_comments[0]}")
+        else:
+            print("No valid line comments. Posting summary-only review.")
 
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 url, json=review_payload, headers=self._headers
             )
+
+            if response.status_code == 422:
+                error_details = response.json()
+                print("=" * 60)
+                print("GitHub API 422 Error Details:")
+                print(f"Error: {error_details}")
+                print(f"Payload sent: {review_payload}")
+                print("=" * 60)
+
             response.raise_for_status()
             print(f"Successfully posted review to {repo_full_name}#{pr_number}")
             return response.json()
