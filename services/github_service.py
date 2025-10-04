@@ -2,10 +2,11 @@ import time
 import jwt
 import httpx
 from functools import lru_cache
-from typing import Dict, Any
+from typing import Dict, Any, List
 from datetime import datetime, timezone
 
 from core.config import settings
+from utils.diff_parser import DiffParser, validate_and_filter_comments
 
 
 @lru_cache
@@ -122,10 +123,10 @@ class GitHubService:
         repo_full_name: str,
         pr_number: int,
         review_summary: str,
-        review_comments: list,
+        review_comments: List[Dict],
+        diff: str,
     ):
         await self._authenticate()
-        url = f"https://api.github.com/repos/{repo_full_name}/pulls/{pr_number}/reviews"
 
         details_url = f"https://api.github.com/repos/{repo_full_name}/pulls/{pr_number}"
         async with httpx.AsyncClient() as client:
@@ -133,43 +134,36 @@ class GitHubService:
             pr_response.raise_for_status()
             head_sha = pr_response.json()["head"]["sha"]
 
-        print(f"Processing {len(review_comments)} comments from AI response")
+        print(f"\n{'=' * 60}")
+        print(f" Validating {len(review_comments)} comments against diff")
+        print(f"{'=' * 60}")
 
-        valid_comments = []
-        for i, comment in enumerate(review_comments):
-            if not isinstance(comment, dict):
-                print(f"Skipping non-dict comment at index {i}: {comment}")
-                continue
+        diff_parser = DiffParser(diff)
 
-            if "path" not in comment or "body" not in comment:
-                print(f"Skipping comment without path or body: {comment}")
-                continue
+        files_in_diff = diff_parser.get_all_files()
+        print(f"\nFiles in diff: {len(files_in_diff)}")
+        for file_path in files_in_diff:
+            commentable = diff_parser.get_commentable_lines(file_path)
+            if commentable:
+                line_range = f"{min(commentable.keys())}-{max(commentable.keys())}"
+                print(
+                    f"   • {file_path}: {len(commentable)} lines (range: {line_range})"
+                )
 
-            if "side" not in comment:
-                comment["side"] = "RIGHT"
+        print(f"\n Validating comments...")
+        valid_comments = validate_and_filter_comments(review_comments, diff_parser)
 
-            if "line" not in comment or not isinstance(comment["line"], int):
-                print(f"Skipping comment without valid line number: {comment}")
-                continue
-
-            valid_comments.append(
-                {
-                    "path": comment["path"],
-                    "line": comment["line"],
-                    "side": comment["side"],
-                    "body": comment["body"],
-                }
-            )
-
-        # If no valid comments but there were comments in the response, add debugging
         if len(review_comments) > 0 and len(valid_comments) == 0:
-            print(
-                "WARNING: All comments were filtered out. This might indicate a formatting issue."
-            )
-            print(
-                "Sample comment from AI:",
-                review_comments[0] if review_comments else "None",
-            )
+            print(f"\n{' ' * 20}")
+            print("WARNING: All comments were filtered out!")
+            print("This means the AI generated comments for lines not in the diff.")
+            print(f"\nFirst AI comment attempted:")
+            if review_comments:
+                first = review_comments[0]
+                print(f"  Path: {first.get('path')}")
+                print(f"  Line: {first.get('line')}")
+                print(f"  Body: {first.get('body', '')[:100]}...")
+            print(f"{' ' * 20}\n")
 
         review_payload = {
             "commit_id": head_sha,
@@ -179,11 +173,14 @@ class GitHubService:
 
         if valid_comments:
             review_payload["comments"] = valid_comments
-            print(f"Posting review with {len(valid_comments)} comments")
-            print(f"Sample comment: {valid_comments[0]}")
+            print(f"\n Posting review with {len(valid_comments)} valid comments")
+            if valid_comments:
+                sample = valid_comments[0]
+                print(f"   Sample: {sample['path']}:{sample['line']}")
         else:
-            print("No valid line comments. Posting summary-only review.")
+            print("\n  No valid line comments. Posting summary-only review.")
 
+        url = f"https://api.github.com/repos/{repo_full_name}/pulls/{pr_number}/reviews"
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 url, json=review_payload, headers=self._headers
@@ -191,12 +188,19 @@ class GitHubService:
 
             if response.status_code == 422:
                 error_details = response.json()
-                print("=" * 60)
-                print("GitHub API 422 Error Details:")
-                print(f"Error: {error_details}")
-                print(f"Payload sent: {review_payload}")
-                print("=" * 60)
+                print(f"\n{'=' * 60}")
+                print(" GitHub API 422 Error Details:")
+                print(f"Error message: {error_details.get('message')}")
+                print(f"Errors: {error_details.get('errors')}")
+                print(f"\nPayload sent:")
+                print(f"  Commit: {review_payload['commit_id']}")
+                print(f"  Comments: {len(review_payload.get('comments', []))}")
+                if review_payload.get("comments"):
+                    print(f"  First comment: {review_payload['comments'][0]}")
+                print(f"\nDiff info:")
+                print(f"  First 500 chars:\n{diff[:500]}")
+                print(f"{'=' * 60}\n")
 
             response.raise_for_status()
-            print(f"Successfully posted review to {repo_full_name}#{pr_number}")
+            print(f" Successfully posted review to {repo_full_name}#{pr_number}")
             return response.json()

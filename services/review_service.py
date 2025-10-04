@@ -3,14 +3,12 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from core.config import settings
 from schemas.review import AIGeneratedReview
+from utils.diff_parser import DiffParser
+
 
 PROMPT_TEMPLATE = """
 You are an expert code reviewer for a professional software engineering team.
 Your goal is to provide a helpful and constructive review of the following pull request.
-Please analyze the provided pull request diff and generate a high-level summary
-and specific, line-by-line comments where you see opportunities for improvement.
-Focus on code quality, potential bugs, best practices, and maintainability.
-Do not comment on trivial style issues that a linter would catch.
 
 **Pull Request Title:**
 {pr_title}
@@ -18,50 +16,47 @@ Do not comment on trivial style issues that a linter would catch.
 **Pull Request Body:**
 {pr_body}
 
-**Code Diff:**
-```diff
-{diff}
-```
+**Added/Modified Lines (THESE ARE THE ONLY LINES YOU CAN COMMENT ON):**
+{commentable_lines}
 
-**Instructions:**
+**CRITICAL INSTRUCTIONS:**
 - Provide a concise, high-level summary of the PR (2-4 sentences).
-- You MUST provide at least 3-5 line-by-line comments for meaningful code changes, even if they are minor suggestions.
+- Generate 3-5 specific line-by-line comments for the code shown above.
+-  IMPORTANT: You can ONLY comment on line numbers that appear in the "Added/Modified Lines" section above.
+- DO NOT invent line numbers. DO NOT comment on lines not shown above.
 - For each comment, you MUST specify:
-  * `path`: The file path (e.g., "src/main.py") - extract this from the diff headers (lines starting with "+++")
-  * `line`: The exact line number in the NEW version of the file (look for line numbers after @@ in the diff)
-  * `side`: Use "RIGHT" for commenting on new/added code (lines starting with +)
-  * `body`: Your constructive feedback (be specific and helpful)
-- Focus on lines that start with "+" (new code) in the diff.
-- Look for these types of issues to comment on:
-  * Potential bugs or edge cases
-  * Security vulnerabilities
-  * Performance concerns
-  * Code readability improvements
-  * Missing error handling
-  * Best practices violations
-  * Suggestions for better variable naming
-  * Opportunities for code simplification
-  * Missing documentation for complex logic
-- If the code is already excellent, provide suggestions for minor improvements or alternative approaches.
-- Your entire response must be in the JSON format specified below.
+  * `path`: The file path (EXACTLY as shown above, e.g., "packages/whatsapp/src/schemas.ts")
+  * `line`: The EXACT line number shown above (must match one of the line numbers you see)
+  * `side`: Always use "RIGHT"
+  * `body`: Your constructive feedback (2-4 sentences, be specific and helpful)
 
-**How to extract file paths and line numbers from diffs:**
+**What to look for:**
+- Potential bugs or edge cases
+- Security vulnerabilities  
+- Performance concerns
+- Code readability improvements
+- Missing error handling
+- Best practices violations
+- Better variable/function naming
+- Opportunities for code simplification
+- Missing documentation for complex logic
+- Type safety issues
+- Inconsistent patterns
 
-Example diff:
-```
-diff --git a/src/utils.py b/src/utils.py
---- a/src/utils.py
-+++ b/src/utils.py
-@@ -10,5 +12,7 @@ def example():
-+    new_line = "test"
-```
-
-- File path: "src/utils.py" (from "+++ b/src/utils.py", remove the "b/" prefix)
-- Line number: 12 (from "@@ -10,5 +12,7 @@", the "12" is the starting line in the new file)
-- For subsequent lines, increment from the starting line number
+**CRITICAL:** Before including a comment, double-check that the line number actually appears in the "Added/Modified Lines" section. If you're not 100% certain, skip that comment.
 
 **JSON Output Format:**
 {format_instructions}
+
+Example of CORRECT comment:
+{{
+  "path": "src/main.py",
+  "line": 42,
+  "side": "RIGHT",
+  "body": "Consider adding null checking here to prevent potential runtime errors if the user object is undefined."
+}}
+
+REMEMBER: Only use line numbers that appear in the Added/Modified Lines list above!
 """
 
 
@@ -85,38 +80,69 @@ review_chain = get_review_chain()
 
 
 async def generate_review_for_pr(pr_title: str, pr_body: str, diff: str) -> dict:
-    print("Generating AI review...")
+    print("\n🤖 Generating AI review...")
 
-    print(f"Diff length: {len(diff)} characters")
-    print(
-        f"Number of added lines: {diff.count('+') - diff.count('+++') - diff.count('++ ')}"
-    )
+    diff_parser = DiffParser(diff)
+    commentable_context = diff_parser.get_added_lines_context()
 
-    response = await review_chain.ainvoke(
-        {
-            "pr_title": pr_title,
-            "pr_body": pr_body,
-            "diff": diff,
+    if (
+        not commentable_context.strip()
+        or commentable_context == "No added lines found in diff."
+    ):
+        print("  No added lines found in diff - nothing to review")
+        return {
+            "summary": "This PR contains no added code lines to review (only deletions or file renames).",
+            "comments": [],
         }
+
+    total_files = len(diff_parser.get_all_files())
+    total_lines = sum(
+        len(diff_parser.get_commentable_lines(f)) for f in diff_parser.get_all_files()
     )
 
-    print("AI review generated successfully.")
-    print("=" * 50)
-    print(f"Summary: {response.get('summary', 'N/A')}")
+    print(f" Diff Statistics:")
+    print(f"   • Total diff size: {len(diff):,} characters")
+    print(f"   • Files modified: {total_files}")
+    print(f"   • Added lines: {total_lines}")
 
-    if "comments" in response and response["comments"]:
-        print(f"Generated {len(response['comments'])} comments")
-        print("First comment sample:")
-        print(f"  Path: {response['comments'][0].get('path')}")
-        print(f"  Line: {response['comments'][0].get('line')}")
-        print(f"  Body: {response['comments'][0].get('body')[:50]}...")
+    print(f"\n Sending commentable lines to AI (preview):")
+    preview = commentable_context[:400]
+    print(preview + "..." if len(commentable_context) > 400 else preview)
+
+    try:
+        response = await review_chain.ainvoke(
+            {
+                "pr_title": pr_title,
+                "pr_body": pr_body or "No description provided.",
+                "commentable_lines": commentable_context,
+            }
+        )
+    except Exception as e:
+        print(f" Error generating AI review: {e}")
+        return {
+            "summary": "Failed to generate AI review due to an error.",
+            "comments": [],
+        }
+
+    print("\n AI review generated successfully")
+    print("=" * 60)
+    summary = response.get("summary", "N/A")
+    print(f" Summary: {summary[:150]}{'...' if len(summary) > 150 else ''}")
+
+    comments = response.get("comments", [])
+    if comments:
+        print(f"\nGenerated {len(comments)} comments:")
+        for i, comment in enumerate(comments[:5], 1):
+            path = comment.get("path", "N/A")
+            line = comment.get("line", "N/A")
+            body = comment.get("body", "")
+            preview_body = body[:60] + "..." if len(body) > 60 else body
+            print(f"   {i}. {path}:{line} - {preview_body}")
+
+        if len(comments) > 5:
+            print(f"   ... and {len(comments) - 5} more")
     else:
-        print("No specific comments generated")
+        print("\n  No specific comments generated by AI")
 
-        if diff.count("+") - diff.count("+++") - diff.count("++ ") > 0:
-            print(
-                "WARNING: Added lines detected but no comments generated. This might indicate an issue."
-            )
-
-    print("=" * 50)
+    print("=" * 60)
     return response

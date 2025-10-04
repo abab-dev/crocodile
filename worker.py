@@ -11,61 +11,77 @@ celery_app = Celery(
 
 @celery_app.task
 def review_pull_request_task(installation_id: int, repo_full_name: str, pr_number: int):
-    print(f"--- Starting review for PR #{pr_number} in {repo_full_name} ---")
-    try:
-        review_result = asyncio.run(
-            orchestrate_review(installation_id, repo_full_name, pr_number)
-        )
-        print(f"--- Finished review for PR #{pr_number} in {repo_full_name} ---")
-        return review_result
-    except Exception as e:
-        print(f"!!! ERROR during review for PR #{pr_number}: {e}")
-        return f"Failed to review {repo_full_name}#{pr_number}. Error: {e}"
+    return asyncio.run(orchestrate_review(installation_id, repo_full_name, pr_number))
 
 
 async def orchestrate_review(installation_id: int, repo_full_name: str, pr_number: int):
-    github_service = GitHubService(installation_id=installation_id)
+    try:
+        print(f"--- Starting review for PR #{pr_number} in {repo_full_name} ---")
 
-    pr_details_task = github_service.get_pr_details(repo_full_name, pr_number)
-    pr_diff_task = github_service.get_pr_diff(repo_full_name, pr_number)
-    pr_details, pr_diff = await asyncio.gather(pr_details_task, pr_diff_task)
+        github_service = GitHubService(installation_id=installation_id)
 
-    ai_review = await generate_review_for_pr(
-        pr_title=pr_details["title"], pr_body=pr_details["body"], diff=pr_diff
-    )
+        print(" Fetching PR details and diff...")
+        pr_details_task = github_service.get_pr_details(repo_full_name, pr_number)
+        pr_diff_task = github_service.get_pr_diff(repo_full_name, pr_number)
+        pr_details, pr_diff = await asyncio.gather(pr_details_task, pr_diff_task)
 
-    summary = ai_review.get("summary", "Could not generate a summary.")
-    ai_comments = ai_review.get("comments", [])
+        pr_title = pr_details["title"]
+        pr_body = pr_details["body"]
 
-    print(f"DEBUG: Received {len(ai_comments)} comments from AI")
-    print(f"DEBUG: AI comments: {ai_comments}")
+        print(f" PR Title: {pr_title}")
+        print(f" Diff size: {len(pr_diff)} characters")
 
-    review_comments = []
-    for comment in ai_comments:
-        if hasattr(comment, "dict"):
-            comment_dict = comment.dict()
-        elif hasattr(comment, "model_dump"):
-            comment_dict = comment.model_dump()
-        else:
-            comment_dict = comment
-
-        review_comments.append(
-            {
-                "path": comment_dict.get("path"),
-                "line": comment_dict.get("line"),
-                "side": comment_dict.get("side", "RIGHT"),
-                "body": comment_dict.get("body"),
-            }
+        print("🤖 Generating AI review...")
+        ai_review = await generate_review_for_pr(
+            pr_title=pr_title, pr_body=pr_body, diff=pr_diff
         )
 
-    print(f"DEBUG: Formatted {len(review_comments)} comments for GitHub")
-    print(f"DEBUG: Review comments to post: {review_comments}")
+        summary = ai_review.get("summary", "Could not generate a summary.")
+        ai_comments = ai_review.get("comments", [])
 
-    await github_service.post_review(
-        repo_full_name=repo_full_name,
-        pr_number=pr_number,
-        review_summary=f"### 🤖 AI Review Summary\n\n{summary}",
-        review_comments=review_comments,
-    )
+        print(f"AI Review Results:")
+        print(f"   - Summary: {summary[:100]}...")
+        print(f"   - Comments generated: {len(ai_comments)}")
 
-    return "Review posted successfully."
+        review_comments = []
+        for comment in ai_comments:
+            if hasattr(comment, "dict"):
+                comment_dict = comment.dict()
+            elif hasattr(comment, "model_dump"):
+                comment_dict = comment.model_dump()
+            else:
+                comment_dict = comment
+
+            if all(key in comment_dict for key in ["path", "line", "body"]):
+                review_comments.append(
+                    {
+                        "path": comment_dict.get("path"),
+                        "line": comment_dict.get("line"),
+                        "side": comment_dict.get("side", "RIGHT"),
+                        "body": comment_dict.get("body"),
+                    }
+                )
+            else:
+                print(f"  Skipping malformed comment: {comment_dict}")
+
+        print(f"✓ Formatted {len(review_comments)} valid comments")
+
+        print(" Posting review to GitHub...")
+        await github_service.post_review(
+            repo_full_name=repo_full_name,
+            pr_number=pr_number,
+            review_summary=f"### 🤖 AI Review Summary\n\n{summary}",
+            review_comments=review_comments,
+            diff=pr_diff,
+        )
+
+        print(f" Review completed successfully for {repo_full_name}#{pr_number}")
+        return f"Successfully reviewed {repo_full_name}#{pr_number}"
+
+    except Exception as e:
+        error_msg = f"Failed to review {repo_full_name}#{pr_number}. Error: {str(e)}"
+        print(f" ERROR: {error_msg}")
+        import traceback
+
+        traceback.print_exc()
+        return error_msg
