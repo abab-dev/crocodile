@@ -133,6 +133,8 @@ class GitHubService:
             pr_response.raise_for_status()
             head_sha = pr_response.json()["head"]["sha"]
 
+        print(f"Processing {len(review_comments)} comments from AI response")
+
         valid_comments = []
         for i, comment in enumerate(review_comments):
             if not isinstance(comment, dict):
@@ -157,6 +159,16 @@ class GitHubService:
                     "side": comment["side"],
                     "body": comment["body"],
                 }
+            )
+
+        # If no valid comments but there were comments in the response, add debugging
+        if len(review_comments) > 0 and len(valid_comments) == 0:
+            print(
+                "WARNING: All comments were filtered out. This might indicate a formatting issue."
+            )
+            print(
+                "Sample comment from AI:",
+                review_comments[0] if review_comments else "None",
             )
 
         review_payload = {

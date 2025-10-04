@@ -25,14 +25,24 @@ Do not comment on trivial style issues that a linter would catch.
 
 **Instructions:**
 - Provide a concise, high-level summary of the PR (2-4 sentences).
-- If you have specific feedback, provide comments on individual lines.
+- You MUST provide at least 3-5 line-by-line comments for meaningful code changes, even if they are minor suggestions.
 - For each comment, you MUST specify:
   * `path`: The file path (e.g., "src/main.py") - extract this from the diff headers (lines starting with "+++")
   * `line`: The exact line number in the NEW version of the file (look for line numbers after @@ in the diff)
   * `side`: Use "RIGHT" for commenting on new/added code (lines starting with +)
   * `body`: Your constructive feedback (be specific and helpful)
-- Focus ONLY on lines that start with "+" (new code) in the diff.
-- If there are no specific issues, return an empty list for the comments.
+- Focus on lines that start with "+" (new code) in the diff.
+- Look for these types of issues to comment on:
+  * Potential bugs or edge cases
+  * Security vulnerabilities
+  * Performance concerns
+  * Code readability improvements
+  * Missing error handling
+  * Best practices violations
+  * Suggestions for better variable naming
+  * Opportunities for code simplification
+  * Missing documentation for complex logic
+- If the code is already excellent, provide suggestions for minor improvements or alternative approaches.
 - Your entire response must be in the JSON format specified below.
 
 **How to extract file paths and line numbers from diffs:**
@@ -59,7 +69,7 @@ def get_review_chain():
     llm = ChatGoogleGenerativeAI(
         model="gemini-2.0-flash",
         google_api_key=settings.GOOGLE_API_KEY,
-        temperature=0.2,
+        temperature=0.3,
         convert_system_message_to_human=True,
     )
     parser = JsonOutputParser(pydantic_object=AIGeneratedReview)
@@ -76,6 +86,12 @@ review_chain = get_review_chain()
 
 async def generate_review_for_pr(pr_title: str, pr_body: str, diff: str) -> dict:
     print("Generating AI review...")
+
+    print(f"Diff length: {len(diff)} characters")
+    print(
+        f"Number of added lines: {diff.count('+') - diff.count('+++') - diff.count('++ ')}"
+    )
+
     response = await review_chain.ainvoke(
         {
             "pr_title": pr_title,
@@ -83,9 +99,11 @@ async def generate_review_for_pr(pr_title: str, pr_body: str, diff: str) -> dict
             "diff": diff,
         }
     )
+
     print("AI review generated successfully.")
     print("=" * 50)
     print(f"Summary: {response.get('summary', 'N/A')}")
+
     if "comments" in response and response["comments"]:
         print(f"Generated {len(response['comments'])} comments")
         print("First comment sample:")
@@ -94,5 +112,11 @@ async def generate_review_for_pr(pr_title: str, pr_body: str, diff: str) -> dict
         print(f"  Body: {response['comments'][0].get('body')[:50]}...")
     else:
         print("No specific comments generated")
+
+        if diff.count("+") - diff.count("+++") - diff.count("++ ") > 0:
+            print(
+                "WARNING: Added lines detected but no comments generated. This might indicate an issue."
+            )
+
     print("=" * 50)
     return response

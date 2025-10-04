@@ -1,6 +1,5 @@
 import asyncio
 from celery import Celery
-
 from core.config import settings
 from services.github_service import GitHubService
 from services.review_service import generate_review_for_pr
@@ -10,53 +9,9 @@ celery_app = Celery(
 )
 
 
-def format_review_comments(diff: str, ai_review_comments: list) -> list:
-    formatted_comments = []
-    diff_lines = diff.split("\n")
-
-    for comment in ai_review_comments:
-        target_line_number = comment.get("line_number")
-        if target_line_number is None:
-            continue
-
-        position = 0
-        file_line_counter = 0
-        for i, line in enumerate(diff_lines):
-            if (
-                line.startswith("---")
-                or line.startswith("+++")
-                or line.startswith("@@")
-            ):
-                continue
-            position += 1
-            if line.startswith("-"):
-                continue
-
-            file_line_counter += 1
-            if file_line_counter == target_line_number:
-                formatted_comments.append(
-                    {
-                        "body": comment["comment"],
-                        "position": position,
-                    }
-                )
-                break
-
-    return formatted_comments
-
-
-def find_file_path_from_diff(diff: str) -> str:
-    """A simple helper to extract the first file path from a diff."""
-    for line in diff.split("\n"):
-        if line.startswith("+++ b/"):
-            return line[6:]
-    return "unknown_file.py"
-
-
 @celery_app.task
 def review_pull_request_task(installation_id: int, repo_full_name: str, pr_number: int):
     print(f"--- Starting review for PR #{pr_number} in {repo_full_name} ---")
-
     try:
         review_result = asyncio.run(
             orchestrate_review(installation_id, repo_full_name, pr_number)
@@ -65,7 +20,6 @@ def review_pull_request_task(installation_id: int, repo_full_name: str, pr_numbe
         return review_result
     except Exception as e:
         print(f"!!! ERROR during review for PR #{pr_number}: {e}")
-
         return f"Failed to review {repo_full_name}#{pr_number}. Error: {e}"
 
 
@@ -83,29 +37,29 @@ async def orchestrate_review(installation_id: int, repo_full_name: str, pr_numbe
     summary = ai_review.get("summary", "Could not generate a summary.")
     ai_comments = ai_review.get("comments", [])
 
-    file_path = find_file_path_from_diff(pr_diff)
+    print(f"DEBUG: Received {len(ai_comments)} comments from AI")
+    print(f"DEBUG: AI comments: {ai_comments}")
 
     review_comments = []
-    diff_lines = pr_diff.split("\n")
-    current_file_line = 0
-    position_in_diff = 0
+    for comment in ai_comments:
+        if hasattr(comment, "dict"):
+            comment_dict = comment.dict()
+        elif hasattr(comment, "model_dump"):
+            comment_dict = comment.model_dump()
+        else:
+            comment_dict = comment
 
-    for line in diff_lines:
-        position_in_diff += 1
-        if line.startswith(("---", "+++", "@@")):
-            continue
-        if not line.startswith("-"):
-            current_file_line += 1
+        review_comments.append(
+            {
+                "path": comment_dict.get("path"),
+                "line": comment_dict.get("line"),
+                "side": comment_dict.get("side", "RIGHT"),
+                "body": comment_dict.get("body"),
+            }
+        )
 
-        for comment in ai_comments:
-            if comment.get("line_number") == current_file_line:
-                review_comments.append(
-                    {
-                        "path": file_path,
-                        "position": position_in_diff,
-                        "body": comment["comment"],
-                    }
-                )
+    print(f"DEBUG: Formatted {len(review_comments)} comments for GitHub")
+    print(f"DEBUG: Review comments to post: {review_comments}")
 
     await github_service.post_review(
         repo_full_name=repo_full_name,
