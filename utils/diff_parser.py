@@ -163,7 +163,7 @@ def validate_and_filter_comments(
                 "body": body,
             }
         )
-        print(f"✓  Comment {i + 1}: Valid - {path}:{line}")
+        print(f" Comment {i + 1}: Valid - {path}:{line}")
 
     print(f"\n Validation Summary:")
     print(f"   Total comments: {len(comments)}")
